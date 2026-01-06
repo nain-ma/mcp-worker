@@ -12,6 +12,38 @@ interface Env {
 	// 环境变量可以留空，因为 token 通过邮箱动态获取
 }
 
+// SSE 会话管理
+interface SSESession {
+	id: string;
+	encoder: TextEncoder;
+	controller: ReadableStreamDefaultController;
+	lastActivity: number;
+}
+
+// 全局 SSE 会话存储（内存中）
+const sseSessions = new Map<string, SSESession>();
+
+// 生成唯一的会话 ID
+function generateSessionId(): string {
+	return `session_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+}
+
+// 清理过期的 SSE 会话（超过 5 分钟无活动）
+function cleanupExpiredSessions() {
+	const now = Date.now();
+	const timeout = 5 * 60 * 1000; // 5 分钟
+	for (const [id, session] of sseSessions.entries()) {
+		if (now - session.lastActivity > timeout) {
+			try {
+				session.controller.close();
+			} catch (e) {
+				// 忽略关闭错误
+			}
+			sseSessions.delete(id);
+		}
+	}
+}
+
 // Zod Schema: 创建推广链接的请求参数
 const CreateLinkSchema = z.object({
 	token: z.string().min(1, "Token 不能为空"),
@@ -281,6 +313,55 @@ async function getDomains(params: GetDomainsParams, token: string) {
 	})) || [];
 }
 
+// 发送 SSE 消息
+function sendSSEMessage(session: SSESession, data: any) {
+	try {
+		const message = `data: ${JSON.stringify(data)}\n\n`;
+		session.controller.enqueue(session.encoder.encode(message));
+		session.lastActivity = Date.now();
+	} catch (error) {
+		console.error("发送 SSE 消息失败:", error);
+	}
+}
+
+// 创建 SSE 连接
+function createSSEStream(sessionId: string): ReadableStream {
+	const encoder = new TextEncoder();
+	
+	return new ReadableStream({
+		start(controller) {
+			// 保存会话
+			const session: SSESession = {
+				id: sessionId,
+				encoder,
+				controller,
+				lastActivity: Date.now(),
+			};
+			sseSessions.set(sessionId, session);
+
+			// 发送初始 endpoint 事件
+			const endpointMessage = `event: endpoint\ndata: /messages\n\n`;
+			controller.enqueue(encoder.encode(endpointMessage));
+
+			// 定期发送心跳保持连接
+			const heartbeatInterval = setInterval(() => {
+				try {
+					controller.enqueue(encoder.encode(': heartbeat\n\n'));
+					session.lastActivity = Date.now();
+				} catch (error) {
+					clearInterval(heartbeatInterval);
+				}
+			}, 15000); // 每 15 秒发送一次心跳
+
+			// 清理过期会话
+			cleanupExpiredSessions();
+		},
+		cancel() {
+			sseSessions.delete(sessionId);
+		},
+	});
+}
+
 // 处理 MCP JSON-RPC 请求
 async function handleMCPRequest(request: any): Promise<any> {
 	const { jsonrpc, id, method, params } = request;
@@ -506,9 +587,94 @@ export default {
 				headers: {
 					"access-control-allow-origin": "*",
 					"access-control-allow-methods": "GET, POST, OPTIONS",
-					"access-control-allow-headers": "Content-Type",
+					"access-control-allow-headers": "Content-Type, X-Session-Id",
 				},
 			});
+		}
+
+		// SSE 端点 - 建立 SSE 连接
+		if (url.pathname === "/sse" && request.method === "GET") {
+			const sessionId = generateSessionId();
+			const stream = createSSEStream(sessionId);
+
+			return new Response(stream, {
+				headers: {
+					"content-type": "text/event-stream",
+					"cache-control": "no-cache",
+					"connection": "keep-alive",
+					"access-control-allow-origin": "*",
+					"x-session-id": sessionId,
+				},
+			});
+		}
+
+		// SSE 消息端点 - 接收客户端请求并通过 SSE 返回响应
+		if (url.pathname === "/messages" && request.method === "POST") {
+			try {
+				const sessionId = request.headers.get("x-session-id");
+				if (!sessionId) {
+					return new Response(
+						JSON.stringify({
+							error: "缺少 X-Session-Id 头",
+						}),
+						{
+							status: 400,
+							headers: {
+								"content-type": "application/json;charset=UTF-8",
+								"access-control-allow-origin": "*",
+							},
+						}
+					);
+				}
+
+				const session = sseSessions.get(sessionId);
+				if (!session) {
+					return new Response(
+						JSON.stringify({
+							error: "会话不存在或已过期",
+						}),
+						{
+							status: 404,
+							headers: {
+								"content-type": "application/json;charset=UTF-8",
+								"access-control-allow-origin": "*",
+							},
+						}
+					);
+				}
+
+				const requestData = await request.json();
+				const response = await handleMCPRequest(requestData);
+
+				// 通过 SSE 发送响应
+				sendSSEMessage(session, response);
+
+				// 返回确认
+				return new Response(
+					JSON.stringify({ status: "sent" }),
+					{
+						status: 202,
+						headers: {
+							"content-type": "application/json;charset=UTF-8",
+							"access-control-allow-origin": "*",
+						},
+					}
+				);
+			} catch (error) {
+				console.error("处理 SSE 消息错误:", error);
+				return new Response(
+					JSON.stringify({
+						error: error instanceof Error ? error.message : "未知错误",
+					}),
+					{
+						status: 500,
+						headers: {
+							"content-type": "application/json;charset=UTF-8",
+							"access-control-allow-origin": "*",
+						},
+					}
+				);
+			}
 		}
 
 		// 首页 - 显示 MCP 服务信息
@@ -586,6 +752,7 @@ export default {
 			<li><strong>版本:</strong> 1.0.0</li>
 			<li><strong>协议版本:</strong> MCP 2024-11-05</li>
 			<li><strong>部署平台:</strong> Cloudflare Workers</li>
+			<li><strong>传输方式:</strong> HTTP POST + SSE (Server-Sent Events)</li>
 		</ul>
 	</div>
 
@@ -641,8 +808,23 @@ export default {
 	</div>
 
 	<h2>🔌 如何连接</h2>
+	
 	<div class="info-box">
-		<p>在 Claude Desktop 或其他 MCP 客户端配置文件中添加：</p>
+		<h3>方式一：SSE 传输（推荐）</h3>
+		<p>使用 Server-Sent Events，支持实时消息推送：</p>
+		<pre><code>{
+  "mcpServers": {
+    "deepclick": {
+      "url": "https://your-worker.workers.dev/sse"
+    }
+  }
+}</code></pre>
+		<p><strong>优势：</strong> 实时通信、支持服务器推送、更好的集成体验</p>
+	</div>
+
+	<div class="info-box">
+		<h3>方式二：HTTP POST 传输</h3>
+		<p>使用传统的 HTTP 请求-响应模式：</p>
 		<pre><code>{
   "mcpServers": {
     "deepclick": {
@@ -651,8 +833,10 @@ export default {
     }
   }
 }</code></pre>
-		<p>将 <code>your-worker.workers.dev</code> 替换为你的 Worker 域名。</p>
+		<p><strong>优势：</strong> 简单、兼容性好、易于调试</p>
 	</div>
+
+	<p>将 <code>your-worker.workers.dev</code> 替换为你的 Worker 域名。</p>
 
 	<h2>🔧 认证方式</h2>
 	<p><strong>工作流程:</strong></p>
@@ -665,8 +849,48 @@ export default {
 
 	<h2>📖 MCP 协议端点</h2>
 	<ul>
-		<li><code>POST /mcp</code> - MCP JSON-RPC 请求处理</li>
+		<li><code>GET /sse</code> - SSE 连接建立（返回 X-Session-Id）</li>
+		<li><code>POST /messages</code> - SSE 消息端点（需要 X-Session-Id 头）</li>
+		<li><code>POST /mcp</code> - HTTP POST 模式的 JSON-RPC 请求处理</li>
 	</ul>
+	
+	<h2>🔄 传输方式对比</h2>
+	<table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+		<thead>
+			<tr style="background: #34495e; color: white;">
+				<th style="padding: 10px; text-align: left; border: 1px solid #ddd;">特性</th>
+				<th style="padding: 10px; text-align: left; border: 1px solid #ddd;">SSE</th>
+				<th style="padding: 10px; text-align: left; border: 1px solid #ddd;">HTTP POST</th>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<td style="padding: 10px; border: 1px solid #ddd;">实时通信</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">✅ 支持</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">❌ 不支持</td>
+			</tr>
+			<tr style="background: #f8f9fa;">
+				<td style="padding: 10px; border: 1px solid #ddd;">服务器推送</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">✅ 支持</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">❌ 不支持</td>
+			</tr>
+			<tr>
+				<td style="padding: 10px; border: 1px solid #ddd;">连接保持</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">✅ 长连接</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">❌ 短连接</td>
+			</tr>
+			<tr style="background: #f8f9fa;">
+				<td style="padding: 10px; border: 1px solid #ddd;">调试难度</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">⚠️ 较难</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">✅ 简单</td>
+			</tr>
+			<tr>
+				<td style="padding: 10px; border: 1px solid #ddd;">推荐场景</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">生产环境</td>
+				<td style="padding: 10px; border: 1px solid #ddd;">开发调试</td>
+			</tr>
+		</tbody>
+	</table>
 </body>
 </html>
 				`,

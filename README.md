@@ -10,7 +10,8 @@
 - ✅ 自动获取 API Token
 - ✅ 基于 MCP 协议，可与 Claude Desktop 等 AI 应用集成
 - ✅ 部署在 Cloudflare Workers，全球低延迟访问
-- ✅ 支持 HTTP 传输的 MCP 服务
+- ✅ 支持双传输模式：**SSE（实时推送）** 和 **HTTP POST（请求-响应）**
+- ✅ SSE 会话管理和自动心跳保持连接
 
 ## MCP 工具
 
@@ -87,9 +88,23 @@ pnpm dev
 
 ### 3. 测试
 
+#### 测试 HTTP POST 模式
+
 ```bash
 ./test-mcp.sh http://localhost:8787
 ```
+
+#### 测试 SSE 模式
+
+```bash
+./test-sse.sh http://localhost:8787
+```
+
+测试脚本会：
+1. 建立 SSE 连接并获取 Session ID
+2. 发送 `initialize` 和 `tools/list` 请求
+3. 显示通过 SSE 接收到的响应消息
+4. 保持连接直到你按 Ctrl+C 退出
 
 ### 4. 部署到 Cloudflare
 
@@ -141,21 +156,75 @@ AI: 1. 首先获取 Token
 
 **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
+#### 方式一：SSE 传输（推荐）
+
 ```json
 {
   "mcpServers": {
     "deepclick": {
-      "url": "https://your-worker.workers.dev/mcp"
+      "url": "https://your-worker.workers.dev/sse"
     }
   }
 }
 ```
 
+**优势：**
+- ✅ 实时双向通信
+- ✅ 服务器主动推送消息
+- ✅ 保持长连接，减少握手开销
+- ✅ 更好的集成体验
+
+#### 方式二：HTTP POST 传输
+
+```json
+{
+  "mcpServers": {
+    "deepclick": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-http", "https://your-worker.workers.dev/mcp"]
+    }
+  }
+}
+```
+
+**优势：**
+- ✅ 简单易用
+- ✅ 易于调试
+- ✅ 兼容性好
+
 将 `your-worker.workers.dev` 替换为你的 Worker 域名。
 
 ### 直接 HTTP 调用
 
-你也可以直接通过 HTTP POST 调用 MCP 端点：
+#### SSE 模式
+
+```bash
+# 1. 建立 SSE 连接（在终端保持运行）
+curl -N -H "Accept: text/event-stream" https://your-worker.workers.dev/sse
+
+# 响应示例：
+# event: endpoint
+# data: /messages
+#
+# : heartbeat
+# ...
+
+# 2. 从响应头获取 Session ID，然后在另一个终端发送消息
+SESSION_ID="从响应头 X-Session-Id 获取的值"
+
+curl -X POST https://your-worker.workers.dev/messages \
+  -H "Content-Type: application/json" \
+  -H "X-Session-Id: $SESSION_ID" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize"
+  }'
+
+# 响应会通过第一个终端的 SSE 连接返回
+```
+
+#### HTTP POST 模式
 
 ```bash
 # 初始化
@@ -193,6 +262,52 @@ curl -X POST https://your-worker.workers.dev/mcp \
   }'
 ```
 
+## SSE 架构说明
+
+### SSE 工作流程
+
+```
+┌─────────────┐                    ┌─────────────────┐
+│   客户端     │                    │  Worker (SSE)   │
+└──────┬──────┘                    └────────┬────────┘
+       │                                    │
+       │  1. GET /sse                       │
+       ├───────────────────────────────────>│
+       │                                    │
+       │  2. 返回 Stream + Session-ID       │
+       │<───────────────────────────────────┤
+       │                                    │
+       │  3. 接收 event: endpoint           │
+       │     data: /messages                │
+       │<───────────────────────────────────┤
+       │                                    │
+       │  4. POST /messages                 │
+       │     X-Session-Id: xxx              │
+       │     {jsonrpc request}              │
+       ├───────────────────────────────────>│
+       │                                    │
+       │  5. 返回 202 Accepted              │
+       │<───────────────────────────────────┤
+       │                                    │
+       │  6. 通过 SSE 推送响应              │
+       │     data: {jsonrpc response}       │
+       │<───────────────────────────────────┤
+       │                                    │
+       │  7. 心跳保持连接                   │
+       │     : heartbeat                    │
+       │<───────────────────────────────────┤
+       │                                    │
+```
+
+### 关键特性
+
+1. **会话管理**: 每个 SSE 连接分配唯一 Session ID
+2. **自动心跳**: 每 15 秒发送心跳保持连接活跃
+3. **会话清理**: 自动清理超过 5 分钟无活动的会话
+4. **双端点设计**:
+   - `GET /sse`: 建立 SSE 连接
+   - `POST /messages`: 接收客户端请求
+
 ## 开发指南
 
 ### 项目结构
@@ -200,7 +315,9 @@ curl -X POST https://your-worker.workers.dev/mcp \
 ```
 .
 ├── src/
-│   └── index.ts          # Worker 主文件，实现 MCP 服务
+│   └── index.ts          # Worker 主文件，实现 MCP 服务（SSE + HTTP）
+├── test-sse.sh           # SSE 测试脚本
+├── test-mcp.sh           # HTTP POST 测试脚本（如果存在）
 ├── wrangler.json         # Cloudflare Workers 配置
 ├── tsconfig.json         # TypeScript 配置
 ├── package.json          # 项目依赖
@@ -215,12 +332,26 @@ curl -X POST https://your-worker.workers.dev/mcp \
 2. 在 `handleMCPRequest` 的 `tools/call` 分支中添加处理逻辑
 3. 实现具体的 API 调用函数
 
+## 传输方式对比
+
+| 特性 | SSE | HTTP POST |
+|------|-----|-----------|
+| 实时通信 | ✅ 支持 | ❌ 不支持 |
+| 服务器推送 | ✅ 支持 | ❌ 不支持 |
+| 连接类型 | 长连接 | 短连接 |
+| 心跳机制 | ✅ 自动心跳 | ❌ 无 |
+| 会话管理 | ✅ 会话 ID | ❌ 无状态 |
+| 调试难度 | 较难 | 简单 |
+| 推荐场景 | 生产环境 | 开发调试 |
+
 ## 技术栈
 
 - [Cloudflare Workers](https://workers.cloudflare.com/) - 无服务器边缘计算平台
 - [Model Context Protocol](https://modelcontextprotocol.io/) - AI 应用集成协议
 - TypeScript - 类型安全的 JavaScript
 - DeepClick API - 推广链接管理 API
+- Server-Sent Events (SSE) - 实时推送技术
+- ReadableStream API - 流式数据处理
 
 ## License
 
