@@ -80,22 +80,10 @@ const MCP_TOOLS: Tool[] = [
 					type: "string",
 					description: "DeepClick API Token（通过 get_deepclick_token 获取）",
 				},
-				page_num: {
-					type: "number",
-					description: "页码（可选，默认 1）",
-				},
-				page_size: {
-					type: "number",
-					description: "每页数量（可选，默认 10）",
-				},
 				link_name: {
 					type: "string",
 					description: "链接名称（用于搜索，可选）",
-				},
-				link_id: {
-					type: "string",
-					description: "链接 ID（用于搜索，可选）",
-				},
+				}
 			},
 			required: ["token"],
 		},
@@ -108,7 +96,7 @@ const MCP_TOOLS: Tool[] = [
 			properties: {
 				email: {
 					type: "string",
-					description: "用户邮箱地址",
+					description: "用户邮箱地址, 格式为: <用户名拼音>@qiliangjia.com",
 				},
 			},
 			required: ["email"],
